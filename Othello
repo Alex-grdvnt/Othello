@@ -1,0 +1,1640 @@
+import pygame
+import sys
+import copy
+import sqlite3
+from datetime import datetime
+import time
+import fitz
+
+
+def directions(x, y, minX=0, minY=0, maxX=7, maxY=7):
+    valid_directions = []
+    if x != minX: 
+        valid_directions.append((x-1, y))  # checks left
+    if x != minX and y != minY: 
+        valid_directions.append((x-1, y-1))  # checks top left 
+    if x != minX and y != maxY: 
+        valid_directions.append((x-1, y+1))  # checks bottom left 
+
+    if x != maxX: 
+        valid_directions.append((x+1, y))  # checks right
+    if x != maxX and y != minY: 
+        valid_directions.append((x+1, y-1))  # checks top right 
+    if x != maxX and y != maxY: 
+        valid_directions.append((x+1, y+1))  # checks bottom right 
+
+    if y != minY: 
+        valid_directions.append((x, y-1))  # checks above
+    if y != maxY: 
+        valid_directions.append((x, y+1))  # checks below
+
+    return valid_directions  # return valid directions
+
+def load_images(path, size):
+    img = pygame.image.load(f"{path}").convert_alpha()  # loads image with transparency, e.g. the tokens have a transparent background
+    img = pygame.transform.scale(img, size)  # scales image
+    return img 
+
+def load_sprite_sheet(sheet, row, col, newSize, size):
+    image = pygame.Surface((32, 32)).convert_alpha()  # creates a surface for the sprite
+    image.blit(sheet, (0, 0), (row * size[0], col * size[1], size[0], size[1])) # loads sprite sheet
+    image = pygame.transform.scale(image, newSize)  # scales it
+    return image  
+
+class Othello:
+    def __init__(self, depth, playerID, player_name):
+        self.screen = pygame.display.set_mode((1100, 810))  # sets the dimensions of the game window
+        pygame.display.set_caption('Othello')  # sets the title of the game window
+
+        self.player_id = playerID  
+        self.player_name = player_name  
+        self.depth = depth  # depth for the bot's decision making
+        self.player1 = 1  # player 1
+        self.player2 = -1  # friend or bot depending on the mode
+        self.current_player = 1  # tracks the current player
+        self.time = 0  # tracks the time for moves
+        self.data_saved = False  
+        self.history = [] # tracks game state
+
+        self.rows = 8  
+        self.columns = 8  
+        self.moves = [] # tracks who has played
+        
+        self.game_over = False  
+        self.mechanics = Mechanics(self.rows, self.columns, (80, 80), self)  # game mechanics
+        self.bot = Bot(self.mechanics)  
+
+        self.font = "assets/font.ttf"  
+        self.background = pygame.image.load("assets/backGround.jpg").convert()  # loads the background 
+        self.background = pygame.transform.scale(self.background, (1100, 810))  # scales the background
+        self.screen.blit(self.background, (0, 0))  # draws the background on the screen
+        
+        self.save_game_state() # saves inital state of the board
+
+    def save_game_state(self):
+        game_state = {
+            'mechanics': [row[:] for row in self.mechanics.grid_matrix],
+            'current_player': self.current_player  # saves current player and board state in a record
+        }
+        self.history.append(game_state)  # pushes the state to the history stack
+
+    def undo_move(self):
+        if ((self.current_player == 1) or (self.current_player == -1 and self.depth == None)) and self.game_over == False:  # checks if game is allowed to undo
+
+            if len(self.history) > 1 and self.depth == None: # the local mode undoes one move
+                self.history.pop()
+                self.current_player *= -1
+
+            elif len(self.history) > 2: # the bot mode undoes 2 until it becomes the human turn again as to stop the bot replaying its move
+                while self.moves[len(self.moves)-1] != 1: 
+                    self.moves.pop()
+                    self.history.pop()  # Pop the most recent state
+                self.moves.pop()
+                self.history.pop()
+    
+            previous_state = self.history[-1]  # the previous state is now the last in the history stack
+
+            self.mechanics.grid_matrix = [row[:] for row in previous_state['mechanics']]  # deepcopies of the mechanics matrix
+            self.mechanics.tokens.clear()  # removes all tokens from the tokens dictionary
+
+            # recreate the tokens based on the restored mechanics state
+            for y in range(self.rows):
+                for x in range(self.columns):
+                    player = self.mechanics.grid_matrix[y][x] 
+                    if player != 0:  
+                        if player == 1:
+                            token_image = self.mechanics.white_token  
+                        else:
+                            token_image = self.mechanics.black_token 
+                        self.mechanics.tokens[(y, x)] = Token(player, y, x, token_image, self)  
+
+            # recalculate the score based on the mechanics after undoing the move
+            self.mechanics.player1_score = self.mechanics.calc_score(self.player1)
+            self.mechanics.player2_score = self.mechanics.calc_score(self.player2)
+
+        
+            self.draw() # redraws the board
+            self.AI() 
+                
+    def inputs(self):
+        if self.game_over:  
+            return
+        
+        undo_button = Button(
+            pos=(887, 35), 
+            text_input="UNDO",  
+            font=self.get_font(30),  
+            base_colour="White", 
+            hovering_colour="#b68f40",  
+            padding=10,  
+            alpha=0  
+        )
+
+        undo_button.change_colour(pygame.mouse.get_pos()) # hovering effect
+        undo_button.update(self.screen) # refreshes the button
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                connection.close()  
+                pygame.quit()  
+                sys.exit()  
+
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 3: # right mouse button clicked
+                    self.mechanics.logic_board() # print the logic board in terminal for debugging purposes
+
+                if event.button == 1:  # left mouse button clicked
+                    if undo_button.check_for_input(event.pos): 
+                        self.undo_move()
+
+                    if not self.game_over: 
+                        x, y = pygame.mouse.get_pos()  # gets mouse position
+                        x, y = (x - 80) // 80, (y - 80) // 80  # calculate cell based on mouse position
+                        valid_cells = self.mechanics.valid_moves(self.mechanics.grid_matrix, self.current_player)  # retrieves valid moves
+
+                        if not valid_cells:
+                            self.check_for_game_over()
+                            print("there was no valid move")
+                            return
+                        
+                        elif (y, x) in valid_cells: 
+                            self.make_move(y, x) # performs the move
+                            self.moves.append(1) # records that player one was last to play
+                            self.current_player *= -1 # changes player
+                            return
+                                           
+    def AI(self):
+        if self.game_over:
+            return
+
+        # update player scores
+        self.mechanics.player1_score = self.mechanics.calc_score(self.player1)  
+        self.mechanics.player2_score = self.mechanics.calc_score(self.player2)  
+
+        if self.current_player == -1 and self.depth is not None:  # checks if it is the bot's turn
+            new_time = pygame.time.get_ticks()  # start the timer for bot's move
+
+            if not self.mechanics.valid_moves(self.mechanics.grid_matrix, self.current_player):  # ff the bot has no moves
+                if self.check_for_game_over():  # this will check if neither player has a move
+                    return 
+                
+            else:  # if the bot has valid moves
+                cell, score = self.bot.bot_difficulty(self.mechanics.grid_matrix, self.depth, -64, 64, -1)  # Calculate the bot's best move based on variable depth of the minimax calculation
+
+                if new_time - self.time >= 1000:  # adds delay to make the bot feel realistic
+                    self.make_move(cell[0], cell[1])  # executes the bot's move
+                    self.moves.append(-1)  # updates last player to play
+                    self.current_player *= -1  # switches player
+                    
+                    if self.check_for_game_over():
+                        return
+                    
+        elif self.depth is None:  # local mode
+            if self.check_for_game_over():
+                return  
+            self.inputs()  # sends it back on input as no need for AI calculations
+
+    def make_move(self, y, x):
+        self.mechanics.insert_token(self.mechanics.grid_matrix, self.current_player, y, x)  # inserts token on the board
+        swap_tokens = self.mechanics.swap_tokens(y, x, self.mechanics.grid_matrix, self.current_player)  # retrieves token that will be swapped
+
+        for tile in swap_tokens:
+            self.mechanics.animated_transitions(tile, self.current_player)  # animates token transition
+            self.mechanics.grid_matrix[tile[0]][tile[1]] *= -1  # update the titles' state
+        
+        self.time = pygame.time.get_ticks()  # records the time of the move
+        self.save_game_state()  
+        
+    def check_for_game_over(self):
+        current_player_moves = self.mechanics.valid_moves(self.mechanics.grid_matrix, self.current_player)  # retrieves available move for current player
+
+        if not current_player_moves:  
+            self.current_player *= -1  # switches to the other player
+            opponent_moves = self.mechanics.valid_moves(self.mechanics.grid_matrix, self.current_player)  # retrieves available move for other player
+            
+            if not opponent_moves:  # if neither player has moves
+                print("Both players have no moves, game found over")
+                # updates scores
+                self.mechanics.player1_score = self.mechanics.calc_score(self.player1)
+                self.mechanics.player2_score = self.mechanics.calc_score(self.player2)
+                self.mechanics.draw_grid(self.screen) # draws the scores
+                self.game_over = True 
+
+                if not self.data_saved:
+                    save_result = self.save_data(self.mechanics.player1_score, self.mechanics.player2_score) # saves the data in the data base
+                    if save_result:  # if succesfully saved
+                        self.data_saved = True 
+                        print("Data saved successfully.")
+                    else:
+                        print("Failed to save data.")
+                    
+                    self.end_screen(self.mechanics.player1_score, self.mechanics.player2_score) # display end screen
+                return True 
+        return False 
+        
+    def save_data(self, player1_score, player2_score):
+        if self.depth == None: # if a local game no need to save the data
+            return True
+        try:
+            # determines difficulty level
+            if self.depth == 1:
+                difficulty = "EASY"
+            elif self.depth == 3:
+                difficulty = "MEDIUM"
+            elif self.depth == 5:
+                difficulty = "HARD"
+
+            # determines the winner
+            if player1_score > player2_score:
+                self.winner = self.player_name 
+            elif player1_score < player2_score:
+                self.winner = "BOT" 
+            else:
+                self.winner = "DRAW" 
+
+            cursor.execute('''
+                INSERT INTO game (playerID, player, difficulty, playerScore, botScore, winner, date)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (self.player_id, self.player_name, difficulty, player1_score, player2_score, self.winner, datetime.now()))  # executes insertions with parameters
+            connection.commit() 
+            print("Data committed successfully")  # confirms data was saved succesfully
+            return True  
+
+        except sqlite3.Error as e:  # exceptional handling
+            print(f"SQLite error: {e}")  # prints error message
+            return False 
+            
+    def end_screen(self, player1_score, player2_score):
+        screen = pygame.Surface((250, 450), pygame.SRCALPHA)  # create a transparent surface for end screen
+
+        font = self.get_font(20) 
+        if player1_score > player2_score:
+            final_text = font.render("VICTORY", True, '#b68f40')  
+
+        elif player1_score < player2_score:
+            final_text = font.render("DEFEATED", True, '#b68f40') 
+        
+        elif player1_score == player2_score:
+            final_text = font.render("DRAW", True, '#b68f40') 
+
+        elif player1_score > player2_score and self.depth is None:
+            final_text = font.render("WHITE WON", True, '#b68f40')
+
+        elif player1_score < player2_score and self.depth is None:
+            final_text = font.render("BLACK WON", True, '#b68f40')
+
+        text_x = (screen.get_width() - final_text.get_width()) // 2  # centers the text horizontally
+        text_y = 20  # offsets from the top within end screen
+
+        exit_button = Button(
+            pos=(125, 350), 
+            text_input="Exit",  
+            font=self.get_font(20), 
+            base_colour="White",  
+            hovering_colour="#b68f40",  
+            padding=10, 
+            alpha=0  
+        )
+        main_menu_button = Button(
+            pos=(125, 200), 
+            text_input="Main Menu",  
+            font=self.get_font(20),  
+            base_colour="White",  
+            hovering_colour="#b68f40",  
+            padding=10,  
+            alpha=0  
+        )
+
+        while True:
+            mouse_pos_main = pygame.mouse.get_pos() # get mouse position
+            
+            # calculate mouse position relative to the end screen surface
+            screen_x = self.screen.get_width() - screen.get_width() - 20  
+            screen_y = self.screen.get_height() - screen.get_height() - 20  
+            mouse_pos_relative = (mouse_pos_main[0] - screen_x, mouse_pos_main[1] - screen_y) 
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:  
+                    connection.close()
+                    pygame.quit()  
+                    sys.exit()
+
+                elif event.type == pygame.MOUSEBUTTONDOWN:  
+                    if exit_button.check_for_input(mouse_pos_relative):
+                        connection.close()
+                        pygame.quit()  
+                        sys.exit()
+
+                    elif main_menu_button.check_for_input(mouse_pos_relative):  
+                        screen_manager.screen_stack.clear()
+                        screen_manager.push(menu.loading_screen)
+
+            screen.fill((0, 0, 0, 0))  # transparent background
+            screen.blit(final_text, (text_x, text_y))  # draws the final message
+            
+            for button in [exit_button, main_menu_button]:
+                button.change_colour(mouse_pos_relative) 
+                button.update(screen) 
+
+            self.screen.blit(screen, (screen_x, screen_y))
+            pygame.display.update()  
+        
+    def get_font(self, size):
+        try:
+            return pygame.font.Font(self.font, size)  
+        except FileNotFoundError:  
+            print(f"Font file {self.font} not found.")  
+            return pygame.font.Font(None, size) 
+    
+    def draw(self):
+        self.mechanics.draw_grid(self.screen)  # draws the board
+        pygame.display.update()
+        
+    def run(self):
+        while self.game_over == False:  
+            self.inputs()  # Handle inputs
+            self.AI()  
+            self.draw() 
+
+class Mechanics:
+    def __init__(self, rows, columns, size, main):
+        self.GAME = main # uses a composition with the Othello class
+        self.y = rows
+        self.x = columns
+        self.size = size
+
+        self.white_token = load_images('assets/whitetoken.png', size)
+        self.black_token = load_images('assets/blacktoken.png', size)
+        self.white_to_black = [load_images(f'assets/blacktowhite{i}.png', self.size) for i in range(1, 4)]
+        self.black_to_white = [load_images(f'assets/whitetoblack{i}.png', self.size) for i in range(1, 4)]
+        self.board = self.load_sprite()
+
+        self.tokens = {}
+        self.grid_board = self.create_bg_img()
+        self.grid_matrix = self.regen_grid(self.y, self.x)
+
+        self.player1_score = 0
+        self.player2_score = 0
+
+        self.font = pygame.font.SysFont('Arial', 20, True, False)
+
+    def load_sprite(self):
+        alphabet = 'ABCDEFGHI'
+        sprite_sheet = pygame.image.load('assets/board.png').convert_alpha()
+        board_images = {} # dictionary to store the board's images by key
+
+        for i in range(3):
+            for j in range(7):
+                # generates kkey and attaches an image from the sprite sheet to it
+                board_images[alphabet[j]+str(i)] = load_sprite_sheet(sprite_sheet, j, i, (self.size), (32, 32))
+        return board_images
+
+    def create_bg_img(self):
+        grid_board = [
+            ['C0', 'D0', 'D0', 'D0', 'D0', 'D0', 'D0', 'D0', 'D0', 'E0'],
+            ['C1', 'A0', 'B0', 'A0', 'B0', 'A0', 'B0', 'A0', 'B0', 'E1'],
+            ['C1', 'B0', 'A0', 'B0', 'A0', 'B0', 'A0', 'B0', 'A0', 'E1'],
+            ['C1', 'A0', 'B0', 'A0', 'B0', 'A0', 'B0', 'A0', 'B0', 'E1'],
+            ['C1', 'B0', 'A0', 'B0', 'A0', 'B0', 'A0', 'B0', 'A0', 'E1'],
+            ['C1', 'A0', 'B0', 'A0', 'B0', 'A0', 'B0', 'A0', 'B0', 'E1'],
+            ['C1', 'B0', 'A0', 'B0', 'A0', 'B0', 'A0', 'B0', 'A0', 'E1'],
+            ['C1', 'A0', 'B0', 'A0', 'B0', 'A0', 'B0', 'A0', 'B0', 'E1'],
+            ['C1', 'B0', 'A0', 'B0', 'A0', 'B0', 'A0', 'B0', 'A0', 'E1'],
+            ['C2', 'D2', 'D2', 'D2', 'D2', 'D2', 'D2', 'D2', 'D2', 'E2'],
+        ]
+        image = pygame.Surface((800, 800))
+
+        # iterate through the grid layout and place the corresponding images at the right positions
+        for j in range(len(grid_board)): 
+            row = grid_board[j]
+            for i in range(len(row)):
+                img = row[i]
+                image.blit(self.board[img], (i * self.size[0], j * self.size[1]))
+        return image
+
+    def regen_grid(self, rows, columns):
+        mechanics = []
+
+        # generates a grid filled with 0
+        for y in range(rows):
+            line = []
+            for x in range(columns):
+                line.append(0)
+            mechanics.append(line)
+
+        # places the starting tokens
+        self.insert_token(mechanics, 1, 3, 3)
+        self.insert_token(mechanics, -1, 3, 4)
+        self.insert_token(mechanics, 1, 4, 4)
+        self.insert_token(mechanics, -1, 4, 3)
+
+        return mechanics
+
+    def calc_score(self, player):
+        score = 0
+        for row in self.grid_matrix:
+            for col in row:
+                if col == player:
+                    score += 1
+        return score
+
+    def draw_grid(self, window):
+        window.blit(self.grid_board, (17, 1))
+
+        # calculate scores
+        self.player1_score = self.calc_score(1)
+        self.player2_score = self.calc_score(-1)
+
+        white_score_rect = pygame.Rect(890, 95, 100, 40)  # rectangle for white score
+        black_score_rect = pygame.Rect(890, 205, 100, 40)  # rectangle for black score
+        pygame.draw.rect(window, (0, 0, 0), white_score_rect)  
+        pygame.draw.rect(window, (0, 0, 0), black_score_rect) 
+
+        # changes the colour of the wrting depending on who s turn it is
+        if self.GAME.current_player == 1:
+            white_score_rect = self.font.render(f'White : {self.player1_score}', 1, "#b68f40")
+            black_score_rect = self.font.render(f'Black : {self.player2_score}', 1, "White")
+        
+        if self.GAME.current_player == -1:
+            white_score_rect = self.font.render(f'White : {self.player1_score}', 1, "White")
+            black_score_rect = self.font.render(f'Black : {self.player2_score}', 1, "#b68f40")
+
+        window.blit(white_score_rect, (900, 100))
+        window.blit(black_score_rect, (900, 210))
+
+        # display tokens
+        for token in self.tokens.values():
+            token.draw(window)
+
+
+        mouse_pos = pygame.mouse.get_pos()
+
+        # display available moves for the current player
+        available_moves = self.valid_moves(self.grid_matrix, self.GAME.current_player)
+        
+        if self.GAME.current_player == 1 or self.GAME.depth == None:
+            for move in available_moves:
+                circle_x = 97 + (move[1] * 80) + 40
+                circle_y = 81 + (move[0] * 80) + 40
+                circle_center = (circle_x, circle_y)
+
+                hover_area = pygame.Rect(circle_x - 40, circle_y - 40, 80, 80)
+                is_hovering = hover_area.collidepoint(mouse_pos) # checks if the mouse is hovering over the square
+                colour = 'DarkGrey' if is_hovering else 'White' # changes colour based on hover state
+                pygame.draw.circle(window, colour, circle_center, 12)
+
+    def logic_board(self):
+        # creates a 2D representation of the board for logic purposes
+        print('  | A | B | C | D | E | F | G | H |')
+        row_index = 0
+        for row in self.grid_matrix:
+            line = f'{row_index} |'.ljust(3, " ")
+            for item in row:
+                line += f"{item}".center(3, " ") + '|'
+            print(line)
+            row_index += 1
+        print()
+
+    def playable_cells(self, mechanics, current_player):
+        # checks empty cells that are adjacent of the opponent's tokens
+        valid_tiles = []
+        for gridX, row in enumerate(mechanics):
+
+            for gridY, col in enumerate(row):
+                if mechanics[gridX][gridY] != 0: # if cell not empty skip
+                    continue
+
+                DIRECTIONS = directions(gridX, gridY)
+
+                for direction in DIRECTIONS: # checks in every direction if there are opponent tokens
+                    dirX, dirY = direction
+                    checkedCell = mechanics[dirX][dirY]
+
+                    if checkedCell == 0 or checkedCell == current_player:
+                        continue
+
+                    if (gridX, gridY) in valid_tiles:
+                        continue
+
+                    valid_tiles.append((gridX, gridY))
+        return valid_tiles
+    
+    def swap_tokens(self, x, y, mechanics, player):
+        adjacent_cells = directions(x, y) # list of possible directions
+        if len(adjacent_cells) == 0: # if no token
+            return []
+
+        swap_tokens = []
+        for checkCell in adjacent_cells:
+            checkX, checkY = checkCell # get the coordinate of the cell in that direction
+            difX, difY = checkX - x, checkY - y # calculate the direction of movement
+            current_line = [] # stores tokens to be flipped
+
+            RUN = True
+            while RUN:
+                if mechanics[checkX][checkY] == player * -1:  # if the cell contains an opponent's token, add it to the current line
+                    current_line.append((checkX, checkY))
+
+                elif mechanics[checkX][checkY] == player: # if the cell contains the player's token, the line is valid, stop checking
+                    RUN = False
+                    break
+                elif mechanics[checkX][checkY] == 0: # if the cell is empty, the line is invalid, stop checking
+                    current_line.clear()
+                    RUN = False
+                
+                # move to the next cell in the same direction
+                checkX += difX
+                checkY += difY
+
+                if checkX < 0 or checkX > 7 or checkY < 0 or checkY > 7:
+                    current_line.clear()
+                    RUN = False
+
+            if len(current_line) > 0: # add all valid tokens from the current line to the swap list
+                swap_tokens.extend(current_line)
+
+        return swap_tokens
+
+    def valid_moves(self, mechanics, current_player):
+        valid_cells = self.playable_cells(mechanics, current_player) # gets all cells adjacent to opponent tokens that are empty
+        playable_cells = []
+
+        # checks each cell in valid_cells to determine if it has a valid move
+        for cell in valid_cells:
+            x, y = cell
+            if cell in playable_cells: # skips the cell if it has already been added to the playable_cells list
+                continue
+
+            swap_tiles = self.swap_tokens(x, y, mechanics, current_player)
+            if len(swap_tiles) > 0: # if placing a token at (x, y) flips any tokens, it has a valid move
+                playable_cells.append(cell)
+
+        return playable_cells
+
+    def insert_token(self, mechanics, current_player, y, x):
+        if current_player == 1:
+            token_image = self.white_token
+        else:
+            token_image = self.black_token
+        
+        # creates the new token
+        self.tokens[(y, x)] = Token(current_player, y, x, token_image, self.GAME)
+        # places the new token on the mechanics
+        mechanics[y][x] = self.tokens[(y, x)].player
+
+    def animated_transitions(self, cell, player):
+        # performes the transition of the tokens
+        if player == 1:
+            self.tokens[(cell[0], cell[1])].transition(self.white_to_black, self.white_token)
+        else:
+            self.tokens[(cell[0], cell[1])].transition(self.black_to_white, self.black_token)
+
+    
+    def get_font(self, size):
+        return pygame.font.Font(self.font, size)
+    
+class Token:
+    def __init__(self, player, gridX, gridY, image, main):
+        self.player = player
+        self.gridX = gridX
+        self.gridY = gridY
+        self.posX = 97 + (gridY * 80)
+        self.posY = 81 + (gridX * 80)
+        self.GAME = main # composition with the othello and Mechanics classes
+        self.image = image
+
+    def transition(self, transition_images, token_image):
+        for i in range(1,3):
+            self.image = transition_images[i]
+            self.GAME.draw()
+            time.sleep(0.03)# slows down the transition of the token, to make it look smooth
+        self.image = token_image
+        self.GAME.draw()
+
+    def draw(self, window):
+        window.blit(self.image, (self.posX, self.posY))
+
+class Bot:
+    def __init__(self, grid_object):
+        self.board = grid_object
+
+    def bot_difficulty(self, board, depth, alpha, beta, player):
+        available_moves = self.board.valid_moves(board, player)  # get available moves
+        if depth == 0 or len(available_moves) == 0: # stops recursion when depth is 0 or no more available moves
+            score = self.evaluate_board(board, player)  # uses a scoring function to evaluate
+            return None, score
+
+        # maximising player
+        if player < 0:
+            best_score = float('-inf')  # uses negative infinity for maximisation
+            best_move = None
+
+            for move in available_moves:
+                new_grid = self.simulate_move(board, move, player) 
+                _, value = self.bot_difficulty(new_grid, depth - 1, alpha, beta, -player) # recursively evaluates the resulting board state
+
+                if value > best_score: # updates best score and perform the move if better
+                    best_score = value 
+                    best_move = move 
+
+                alpha = max(alpha, best_score) # updates alpha for pruning
+                if beta <= alpha:
+                    break
+
+            return best_move, best_score
+
+        # minimising player
+        else:
+            best_score = float('inf')  # Use positive infinity for minimisation
+            best_move = None
+
+            for move in available_moves:
+                new_grid = self.simulate_move(board, move, player) 
+                _, value = self.bot_difficulty(new_grid, depth - 1, alpha, beta, -player) # recursively evaluates the resulting board state
+
+                if value < best_score: # updates best score and perform the move if better
+                    best_score = value
+                    best_move = move
+                beta = min(beta, best_score) # updates beta for pruning
+                if beta <= alpha:
+                    break
+
+            return best_move, best_score
+
+    def evaluate_board(self, mechanics, player):
+        score = 0
+        opponent = -player
+
+        # Define the corner, edge, and adjacent positions
+        corners = [(0, 0), (0, 7), (7, 0), (7, 7)]
+        edges = [(0, i) for i in range(2, 6)] + [(7, i) for i in range(2, 6)] + [(i, 0) for i in range(2, 6)] + [(i, 7) for i in range(2, 6)]
+        corner_adjacents = [
+            (1, 0), (0, 1), (1, 1),  # Adjacent to (0, 0)
+            (1, 7), (0, 6), (1, 6),  # Adjacent to (0, 7)
+            (6, 0), (7, 1), (6, 1),  # Adjacent to (7, 0)
+            (6, 7), (7, 6), (6, 6)   # Adjacent to (7, 7)
+        ]
+
+        # Evaluate each cell in the mechanics
+        for x in range(8):
+            for y in range(8):
+                if mechanics[x][y] == player:
+                    score += 1  # Count player's tokens
+
+                    if (x, y) in corners:
+                        score += 10  # prioritises corners
+                    
+                    elif (x, y) in edges:
+                        score += 3  # prioritises edges but less than corners
+
+                    elif (x, y) in corner_adjacents:
+                        score -= 2  # penalises adjacent corner cells
+
+                elif mechanics[x][y] == opponent:
+                    score -= 1  # Count player's tokens
+
+                    if (x, y) in corners:
+                        score -= 10  # prioritises corners
+                    
+                    elif (x, y) in edges:
+                        score -= 3  # prioritises edges but less than corners
+
+                    elif (x, y) in corner_adjacents:
+                        score += 2  # penalises adjacent corner cells
+
+
+        return score 
+
+    def simulate_move(self, mechanics, move, player):
+        new_grid = copy.deepcopy(mechanics) # makes a copy of the mechanics and apply the move as to perform simulations
+        x, y = move
+        swap_tokens = self.board.swap_tokens(x, y, new_grid, player) 
+        new_grid[x][y] = player
+        for tile in swap_tokens:
+            new_grid[tile[0]][tile[1]] = player
+        return new_grid
+
+
+class Button:
+    def __init__(self, pos, text_input, font, base_colour, hovering_colour, padding=10, alpha=150):
+        self.pos = pos
+        self.text_input = text_input
+        self.font = font
+        self.base_colour = base_colour
+        self.hovering_colour = hovering_colour
+        self.padding = padding
+        self.alpha = alpha  # adds alpha for transparency
+        self.hovering = False  
+
+        # renders the text
+        self.text = self.font.render(self.text_input, True, self.base_colour)
+        self.rect = self.text.get_rect(center=self.pos)
+
+    def update(self, screen):
+        # creates a surface for the button with an alpha value
+        button_surface = pygame.Surface((self.rect.width + self.padding, self.rect.height + self.padding), pygame.SRCALPHA)
+        button_surface.fill((0, 0, 0, self.alpha))  # fills with black and set alpha
+
+        # draws the button surface and the text on top
+        screen.blit(button_surface, (self.rect.x - self.padding // 2, self.rect.y - self.padding // 2))
+        screen.blit(self.text, self.rect)
+
+    def change_colour(self, mousePos):
+        # updates the button colour based on hover status
+        if self.rect.collidepoint(mousePos):
+            self.hovering = True
+        else:
+            self.hovering = False
+        self.text = self.font.render(self.text_input, True, self.hovering_colour if self.hovering else self.base_colour)
+
+    def check_for_input(self, mousePos):
+        return self.rect.collidepoint(mousePos)
+
+
+class Menu:
+    def __init__(self):
+        self.screen = pygame.display.set_mode((1100, 810))
+        pygame.display.set_caption("Menu")
+        self.background = pygame.transform.scale(pygame.image.load("assets/backGround.jpg"), (1100, 800))
+        self.font = "assets/font.ttf"
+
+    def create_table(self):
+        # creates the game table if it doesn't already exist
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS game (
+            playerID CHAR(5),
+            difficulty TEXT CHECK(difficulty IN ('EASY', 'MEDIUM', 'HARD')),
+            player VARCHAR(8) NOT NULL,
+            playerScore VARCHAR(2),
+            winner TEXT CHECK(winner IN ("BOT", player, "DRAW")),
+            botScore VARCHAR(2),
+            date DATE
+        )"""
+        cursor.execute(create_table_query)
+        connection.commit()
+
+    def is_player_name_taken(self, player_name):
+        cursor.execute("SELECT COUNT(*) FROM game WHERE player = ?", (player_name,))
+        return cursor.fetchone()[0] > 0  # returns True if the name exists, else False
+            
+    def retrieve_existing_players(self):
+        cursor.execute("SELECT DISTINCT playerID, player FROM game")
+        return cursor.fetchall()  # returns a list of tuples (playerID, player name)
+    
+    def retrieve_player_name(self, player_id):
+        cursor.execute("SELECT player FROM game WHERE playerID = ?", (player_id,))
+        return cursor.fetchone()[0]  # fetches the player's name
+
+    def add_new_player(self, player_name):
+        player_id = self.generate_playerID()  # generates a unique player ID
+        try: # expectional handling
+            cursor.execute("INSERT INTO game (playerID, player) VALUES (?, ?)", (player_id, player_name))
+            connection.commit()
+        except sqlite3.IntegrityError:
+            print("Failed to add new player. ID may already exist.")
+            return None  
+        return player_id  
+    
+    def generate_playerID(self):
+        cursor.execute("SELECT MAX(CAST(playerID AS INTEGER)) FROM game") # query to get the current maximum player ID in the database
+        max_id = cursor.fetchone()[0]
+        
+        if max_id is None: # if there are no players yet, start with ID 00001 
+            return '00001'
+        
+        new_id = str(max_id + 1).zfill(5)  # increments the max_id and pad it with zeros to ensure it is 5 characters long
+        
+        return new_id 
+    
+    def loading_screen(self):
+        self.screen.blit(self.background, (0, 0))
+        while True: 
+            loading_mouse_pos = pygame.mouse.get_pos()
+
+            # renders loading screen title
+            loading_text = self.get_font(75).render("WELCOME", True, "#b68f40")
+            loading_rect = loading_text.get_rect(center=(550, 100))
+            self.screen.blit(loading_text, loading_rect)
+
+            # creation of buttons
+            buttons = [
+                Button(
+                    pos=(550, 350), 
+                    text_input="EXISTING PLAYER", 
+                    font=self.get_font(60), 
+                    base_colour="White", 
+                    hovering_colour="#b68f40", 
+                    padding=10, 
+                    alpha=0),
+
+                Button(
+                    pos=(550, 500), 
+                    text_input="NEW PLAYER", 
+                    font=self.get_font(60), 
+                    base_colour="White", 
+                    hovering_colour="#b68f40", 
+                    padding=10, 
+                    alpha=0),
+
+                Button(
+                    pos=(950, 750), 
+                    text_input="game rules", 
+                    font=self.get_font(20), 
+                    base_colour="White", 
+                    hovering_colour="#b68f40", 
+                    padding=10, 
+                    alpha=0),
+            ]
+
+            for button in buttons:
+                button.change_colour(loading_mouse_pos) 
+                button.update(self.screen)             
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    connection.close()
+                    pygame.quit()
+                    sys.exit()
+
+                if event.type == pygame.MOUSEBUTTONDOWN:
+                    for button in buttons:
+                        if button.check_for_input(loading_mouse_pos):
+                            # changes screen based on button clicked
+
+                            if button.text_input == "EXISTING PLAYER":
+                                screen_manager.push(menu.show_existing_profiles)
+                                # this is an example of a stack that encapsulates the methods of the menu class as its elements
+                            
+                            elif button.text_input == "NEW PLAYER":
+                                screen_manager.push(menu.name_entry_screen)
+                                # this is an example of a stack that encapsulates the methods of the menu class as its elements
+                            
+                            elif button.text_input == "game rules":
+                                screen_manager.push(menu.rules)
+                                # this is an example of a stack that encapsulates the methods of the menu class as its elements
+
+            pygame.display.update()
+
+    def rules(self):
+        self.screen.blit(self.background, (0, 0)) # draws back ground
+        pygame.display.set_caption("Rules")
+
+        # sets the dimensions of the smaller window where the PDF will be shown
+        pdf_window_width = 770
+        pdf_window_height = 567
+
+        # loads the PDF and convert pages to images
+        doc = fitz.open("assets/rules.pdf")
+        pdf_pages = []
+
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            pix = page.get_pixmap(dpi=200)  # rendersPDF page to a pixmap
+            
+            # calculate scale factor to fit the window fraction
+            scale_factor = pdf_window_width / pix.width  
+            scaled_width = int(pix.width * scale_factor)
+            scaled_height = int(pix.height * scale_factor)
+            
+            # resizes the image using Pygame
+            scaled_page = pygame.transform.smoothscale(pygame.image.frombuffer(pix.samples, (pix.width, pix.height), "RGB"), (scaled_width, scaled_height))
+            pdf_pages.append(scaled_page)
+
+        # combines all scaled pages into one surface (stacked vertically)
+        pdf_height = sum(page.get_height() for page in pdf_pages)
+        pdf_surface = pygame.Surface((pdf_window_width, pdf_height))
+        current_y = 0  # Y position for stacking pages
+
+        for page in pdf_pages: # draws the pages
+            pdf_surface.blit(page, (0, current_y))
+            current_y += page.get_height()
+
+        # scroll variables
+        scroll_y = 0
+        scroll_speed = 50
+
+        # calculates the padding to center the PDF in the window
+        center_x = (1100 - pdf_window_width) // 2
+        center_y = ((810 - pdf_window_height) // 2) -20
+
+        # creates the back button
+        back_button = Button(
+            pos=(550, 730),
+            text_input="BACK",
+            font=self.get_font(60),
+            base_colour="White",
+            hovering_colour="#b68f40",
+            padding=10,
+            alpha=0
+        )
+
+        # displays title
+        prompt_text = self.get_font(40).render("Game rules", True, "#b68f40")
+        prompt_rect = prompt_text.get_rect(center=(self.screen.get_width() / 2, 60))
+        self.screen.blit(prompt_text, prompt_rect)
+
+        while True:
+            back_button.change_colour(pygame.mouse.get_pos())
+            back_button.update(self.screen)
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    connection.close()
+                    doc.close()
+                    pygame.quit()
+                    sys.exit()
+
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if event.button == 1:
+                        if back_button.check_for_input(pygame.mouse.get_pos()):
+                            doc.close()
+                            screen_manager.pop()  # returns to the previous screen
+                            return
+                        
+                    elif event.button == 4:  # scroll up
+                        scroll_y = max(scroll_y - scroll_speed, 0)
+
+                    elif event.button == 5:  # scroll down
+                        scroll_y = min(scroll_y + scroll_speed, pdf_surface.get_height() - pdf_window_height)
+
+            # draws the visible portion of the PDF surface (scrolled) at the centered position
+            self.screen.blit(pdf_surface, (center_x, center_y), (0, scroll_y, pdf_window_width, pdf_window_height))
+
+            pygame.display.update()
+        
+    def name_entry_screen(self):
+        self.screen.blit(self.background, (0, 0))
+        input_active = False
+        player_name = ""
+        colour_active = pygame.Color("lightskyblue")
+        colour_inactive = pygame.Color("white")
+        colour = colour_inactive
+
+        input_box = pygame.Rect(400, 400, 300, 50)
+        font = self.get_font(50)
+
+        # making the cursor blink
+        cursor_visible = True
+        cursor_blink_time = 0.5  # Duration of the blink
+        last_cursor_toggle = pygame.time.get_ticks() 
+
+        # message variable for name check
+        name_message = ""
+        
+        # tracks the scrolling offset
+        scroll_offset = 0
+
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    connection.close()
+                    pygame.quit()
+                    sys.exit()
+
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if input_box.collidepoint(event.pos):
+                        input_active = True
+                        colour = colour_active                       
+                    else:
+                        input_active = False
+                        colour = colour_inactive
+
+                    if back_button.check_for_input(pygame.mouse.get_pos()): # checks if the back button is clicked
+                        screen_manager.pop() # returns to loading screen
+                        return  
+                    
+                elif event.type == pygame.KEYDOWN and input_active:
+                    if event.key == pygame.K_RETURN:
+                        if player_name:
+                            print(f"Attempting to add new player: {player_name}")
+                            if self.is_player_name_taken(player_name):
+                                name_message = "Name already in use"
+
+                            elif  len(player_name) > 8:
+                                name_message = "8 characters maximum"
+
+                            else:
+                                new_player_id = self.add_new_player(player_name)
+                                if new_player_id:
+                                    print(f"New player added: {player_name} with ID: {new_player_id}") 
+
+                                    screen_manager.screen_stack.clear() # clears stack for memory efficiency
+                                    screen_manager.push(menu.loading_screen, menu.show_existing_profiles, (menu.home_screen, new_player_id)) # puts them straight on their profile home sscreen
+                                else:
+                                    print("Failed to add player.") 
+                        else:
+                            name_message = "No name entered!"  
+
+                    elif event.key == pygame.K_BACKSPACE:
+                        player_name = player_name[:-1] # removes the last character
+                    else:
+                        player_name += event.unicode # write what ever character they type
+
+                    self.screen.blit(self.background, (0, 0))
+
+            # draws the enter your name line
+            prompt_text = font.render("Enter your name:", True, "#b68f40")
+            prompt_rect = prompt_text.get_rect(center=(self.screen.get_width() / 2, 300))
+            self.screen.blit(prompt_text, prompt_rect)
+
+            # renders their typings
+            txt_surface = font.render(player_name, True, colour)
+            text_width = txt_surface.get_width()
+
+            # checks if the text width exceeds the input box width
+            if text_width > input_box.width - 10:
+                # calculate scroll offset so that the text dynamically shifts and only appears in the text box
+                scroll_offset = text_width - (input_box.width - 10)
+            else:
+                scroll_offset = 0
+
+            # draws the semi-transparent background for the input box
+            transparent_surface = pygame.Surface((input_box.width, input_box.height), pygame.SRCALPHA)
+            transparent_surface.fill((0, 0, 0, 150))  # Semi-transparent black
+            self.screen.blit(transparent_surface, input_box.topleft)
+
+            # renders the text only in the text box so the overflow becomes transparent
+            clipped_surface = pygame.Surface((input_box.width, input_box.height), pygame.SRCALPHA)
+            clipped_surface.blit(txt_surface, (-scroll_offset, 0))
+            self.screen.blit(clipped_surface, (input_box.x + 5, input_box.y + 5))  
+            pygame.draw.rect(self.screen, colour, input_box, 2)
+
+            # renders any messages if it is needed
+            if name_message:
+                message_surface = self.get_font(20).render(name_message, True, "Red")  # renders the message in red
+                message_rect = message_surface.get_rect(center=(self.screen.get_width() // 2, input_box.y + 100))
+                self.screen.blit(message_surface, message_rect) 
+
+            # handles the cursor and makes it blink
+            current_time = pygame.time.get_ticks()
+            if current_time - last_cursor_toggle > int(cursor_blink_time * 1000):  # check if it is time to toggle
+                cursor_visible = not cursor_visible  # toggle cursor visibility
+                last_cursor_toggle = current_time  # reset last toggle time
+
+            # draws cursor if visible
+            if cursor_visible and input_active:
+                cursor_x = input_box.x + 5 + txt_surface.get_width() - scroll_offset  # position cursor at the end of visible text
+                cursor_height = input_box.height - 10  # cursor's height
+                pygame.draw.rect(self.screen, colour, (cursor_x, input_box.y + 5, 2, cursor_height))  # draws cursor
+
+            # handles the back button the same way the other bcak button
+            back_button = Button(
+                pos=(550, 700),
+                text_input="BACK",
+                font=self.get_font(60),
+                base_colour="White",
+                hovering_colour="#b68f40",
+                padding=10,
+                alpha=0
+            )
+            back_button.change_colour(pygame.mouse.get_pos())
+            back_button.update(self.screen)
+
+            pygame.display.update()
+           
+
+
+    def show_existing_profiles(self):
+        selected_player_id = None 
+        while True:
+            self.screen.blit(self.background, (0, 0))
+
+            players = self.retrieve_existing_players()  # returns list of tuples (playerID, player_name)
+
+            # defines button layout variables
+            num_columns = 3  # number of buttons per row
+            button_width = 200
+            button_height = 60
+            spacing_x = (self.screen.get_width() - (button_width * num_columns)) // (num_columns + 1)
+
+            buttons = []
+
+            for index, (player_id, name) in enumerate(players): # creates a botton for each profile
+                col = index % num_columns  
+                row = index // num_columns  
+                x_position = spacing_x + col * (button_width + spacing_x)
+                y_position = 100 + row * (button_height + 150)
+
+                # creates a button for each profile
+                button = Button(
+                    pos=(x_position + button_width // 2, y_position + button_height // 2),
+                    text_input=name,
+                    font=self.get_font(40),
+                    base_colour="White", 
+                    hovering_colour="#b68f40",
+                    padding=10,
+                    alpha=0
+                )
+                buttons.append((button, player_id))  # stores the button and associated player ID
+
+                # stops creating buttons if maximum number of displayed players is reached
+                if row >= 2 and col >= num_columns - 1:
+                    break
+
+            # draws each player button
+            for button, _ in buttons:
+                button.change_colour(pygame.mouse.get_pos())  # hovering effect
+                button.update(self.screen) # updates button on the screen
+
+            # back button
+            back_button = Button(
+                pos=(550, 700),
+                text_input="BACK",
+                font=self.get_font(60),
+                base_colour="White",
+                hovering_colour="#b68f40",
+                padding=10,
+                alpha=0
+            )
+            back_button.change_colour(pygame.mouse.get_pos())
+            back_button.update(self.screen)
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    connection.close()
+                    pygame.quit()
+                    sys.exit()
+
+                if event.type == pygame.MOUSEBUTTONDOWN:
+                    if back_button.check_for_input(pygame.mouse.get_pos()):
+                        screen_manager.pop()  # return to loading screen
+                        return 
+
+                    for button, player_id in buttons: # checks if any profile has been selected
+                        if button.check_for_input(pygame.mouse.get_pos()):
+                            selected_player_id = player_id  
+                            screen_manager.push((menu.home_screen, selected_player_id))  # passes the player ID to the options screen
+                            return  
+
+            pygame.display.update()
+
+    def home_screen(self, selected_player_id):
+        selected_player_name = self.retrieve_player_name(selected_player_id)  # retrieves the player name by the ID
+        while True:
+            self.screen.blit(self.background, (0, 0))
+
+            # displays selected player
+            font = self.get_font(70)
+            text_surface = font.render(f"PLAYER:{selected_player_name}", True, "#b68f40")
+            self.screen.blit(text_surface, (self.screen.get_width() // 2 - text_surface.get_width() // 2, 70))
+
+            # creates buttons for Play, Stats, delete, and Back
+            play_button = Button(
+                pos=(550, 280),
+                text_input="PLAY",
+                font=self.get_font(50),
+                base_colour="White",
+                hovering_colour="#b68f40",
+                padding=10,
+                alpha=0
+            )
+            stats_button = Button(
+                pos=(800, 480),
+                text_input="STATS",
+                font=self.get_font(50),
+                base_colour="White",
+                hovering_colour="#b68f40",
+                padding=10,
+                alpha=0
+            )
+            back_button = Button(
+                pos=(550, 700),
+                text_input="BACK",
+                font=self.get_font(60),
+                base_colour="White",
+                hovering_colour="#b68f40",
+                padding=10,
+                alpha=0
+            )
+            delete_button = Button(
+                pos=(300, 480),
+                text_input="DELETE",
+                font=self.get_font(50),
+                base_colour="White",
+                hovering_colour="#b68f40",
+                padding=10,
+                alpha=0
+            )
+
+            # draws the buttons
+            for button in [play_button, stats_button, delete_button, back_button]:
+                button.change_colour(pygame.mouse.get_pos())
+                button.update(self.screen)
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    connection.close()
+                    pygame.quit()
+                    sys.exit()
+
+                if event.type == pygame.MOUSEBUTTONDOWN:
+                    if play_button.check_for_input(pygame.mouse.get_pos()):
+                        screen_manager.push((menu.mode, selected_player_id, selected_player_name))  # sebd the player on the mode page
+
+                    elif stats_button.check_for_input(pygame.mouse.get_pos()):
+                        screen_manager.push((menu.show_player_stats, selected_player_id))  # shows stats for the selected player
+
+                    elif delete_button.check_for_input(pygame.mouse.get_pos()):
+                        if self.confirmation_popup(self.screen, selected_player_id) == True: # displays pop up as to prevent accidental deletion of profile
+                            try:
+                                cursor.execute("DELETE FROM game WHERE playerID = ?", (selected_player_id,)) # deletes all data associated with that ID
+                                connection.commit()
+                                print(f"Player with ID {selected_player_id} and all related data have been deleted.")
+                                screen_manager.pop()
+                            except sqlite3.Error as e:
+                                print(f"An error occurred while deleting player data: {e}")
+
+                    elif back_button.check_for_input(pygame.mouse.get_pos()):
+                        screen_manager.pop() # returns to profile page
+                        
+            pygame.display.update()
+
+    def confirmation_popup(self, screen, selected_player_id):
+        # retrieves player name and setups dimensions
+        player_name = self.retrieve_player_name(selected_player_id)
+        popup_width, popup_height = 500, 200
+        popup_rect = pygame.Rect(
+            (screen.get_width() - popup_width) // 2,
+            (screen.get_height() - popup_height) // 2,
+            popup_width,
+            popup_height
+        )
+        text_colour = "#b68f40" 
+
+        # confirmation message
+        font = pygame.font.Font(None, 30)
+        message = f"Are you sure you want to delete {player_name}?"
+        text_surface = font.render(message, True, text_colour)
+
+        # creates a black popup 
+        popup_surface = pygame.Surface((popup_width, popup_height))
+        popup_surface.fill((0, 0, 0))  
+
+        # Yes and No buttons
+        yes_button = Button(
+            pos=(popup_rect.centerx - 70, popup_rect.centery + 40),
+            text_input="YES",
+            font=font,
+            base_colour="White",
+            hovering_colour="#b68f40",
+            padding=10
+        )
+        no_button = Button(
+            pos=(popup_rect.centerx + 70, popup_rect.centery + 40),
+            text_input="NO",
+            font=font,
+            base_colour="White",
+            hovering_colour="#b68f40",
+            padding=10
+        )
+
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    connection.close()
+                    pygame.quit()
+                    sys.exit()
+
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if yes_button.check_for_input(pygame.mouse.get_pos()):
+                        return True  # confirms deletion
+                    
+                    elif no_button.check_for_input(pygame.mouse.get_pos()):
+                        return False  # cancels deletion
+
+            screen.blit(popup_surface, popup_rect.topleft) # draws pop up
+
+            # draws the confirmation message centered on the popup
+            screen.blit(
+                text_surface,
+                (popup_rect.centerx - text_surface.get_width() // 2, popup_rect.y + 40)
+            )
+
+            # updates the buttons
+            for button in [yes_button, no_button]:
+                button.change_colour(pygame.mouse.get_pos())
+                button.update(screen)
+
+            pygame.display.update()
+            
+    def show_player_stats(self, selected_player_id):
+        # fetches the player's statistics from the database based on their ID
+        cursor.execute('''SELECT difficulty, playerScore, botScore, winner, date 
+                            FROM game 
+                            WHERE playerID = ?
+                            ORDER BY date DESC''', (selected_player_id,))
+        results = cursor.fetchall()
+
+        # defines the column headers
+        headers = ["Difficulty", "Player", "Bot", "Winner", "Date"]
+        header_font = self.get_font(20)
+        row_font = self.get_font(20)
+
+        # positions the headers and spaces them out
+        header_y_position = 100  
+        fixed_spacing = 80  
+        header_x_positions = []
+        current_x_position = 60  # starting position for the first header
+
+        # renders the headers
+        for index, header in enumerate(headers):
+            colour = "White" if header in ["Player", "Winner"] else "#b68f40"  # alternates the colour of the headers
+            header_text = header_font.render(header, True, colour)
+            self.screen.blit(header_text, (current_x_position, header_y_position))
+            header_x_positions.append(current_x_position)
+            current_x_position += header_text.get_width() + fixed_spacing
+
+        # creates a window for the scrollable content
+        scrollable_window_height = 460 
+        scrollable_window_width = 1100  
+        scrollable_window = pygame.Surface((scrollable_window_width, scrollable_window_height), pygame.SRCALPHA)
+
+        # scroll variables
+        scroll_y = 0
+        scroll_speed = 30  
+        content_height = len(results) * 40  # calculates total height of the content
+
+        while True:
+            self.screen.blit(self.background, (0, 0))
+
+            # draws the headers
+            for index, header in enumerate(headers):
+                colour = "White" if header in ["Player", "Winner"] else "#b68f40"
+                header_text = header_font.render(header, True, colour)
+                self.screen.blit(header_text, (header_x_positions[index], header_y_position))
+
+            scrollable_window.fill((0, 0, 0, 0)) # clears the scrollable window
+
+            # draws the content inside the scrollable window
+            for index, row in enumerate(results):
+                difficulty, player_score, bot_score, winner, date = row
+
+                # skips invalid rows
+                if (difficulty == "N/A" or player_score == None or bot_score == None or winner == "N/A" or date == "N/A"):
+                    continue
+
+                data_row_y_position = index * 40 - scroll_y  # adjusts position due to scroll
+
+                # skips rows that are outside the visible area of the scrollable window
+                if data_row_y_position < 0 or data_row_y_position > scrollable_window_height:
+                    continue
+
+                # renders the row text
+                difficulty_text = row_font.render(difficulty, True, "#b68f40")
+                player_score_text = row_font.render(str(player_score), True, "White")
+                bot_score_text = row_font.render(str(bot_score), True, "#b68f40")
+                winner_text = row_font.render(winner, True, "White")
+                date_text = row_font.render(date, True, "#b68f40")
+
+                # blits the row text onto the scrollable window
+                scrollable_window.blit(difficulty_text, (header_x_positions[0], data_row_y_position))
+                scrollable_window.blit(player_score_text, (header_x_positions[1], data_row_y_position))
+                scrollable_window.blit(bot_score_text, (header_x_positions[2], data_row_y_position))
+                scrollable_window.blit(winner_text, (header_x_positions[3], data_row_y_position))
+                scrollable_window.blit(date_text, (header_x_positions[4], data_row_y_position))
+
+            # creates the Back button
+            back_button = Button(
+                pos=(550, 700),
+                text_input="BACK",
+                font=self.get_font(60),
+                base_colour="White",
+                hovering_colour="#b68f40",
+                padding=10,
+                alpha=0
+            )
+
+            back_button.change_colour(pygame.mouse.get_pos())
+            back_button.update(self.screen)
+
+            # draws the scrollable window with its content
+            self.screen.blit(scrollable_window, (0, header_y_position + 80))
+            
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    connection.close()
+                    pygame.quit()
+                    sys.exit()
+
+                if event.type == pygame.MOUSEBUTTONDOWN:
+                    if back_button.check_for_input(pygame.mouse.get_pos()):
+                        screen_manager.pop() # returns to home screen of the player
+
+                   # handles scroll only if the content is larger than the scrollable window
+                    if content_height > scrollable_window_height:
+                        if event.button == 4:  # scrolls up
+                            scroll_y = max(scroll_y - scroll_speed, 0)
+
+                        elif event.button == 5:  # scrolls down
+                            scroll_y = min(scroll_y + scroll_speed, content_height - scrollable_window_height)
+
+            pygame.display.update()
+
+    def mode(self, selected_player_id, selected_player_name):
+        self.screen.blit(self.background, (0, 0))
+        
+        # creation of buttons which uses both encapsulation and composition whilst storing the data in the buttons list
+        buttons = [
+            Button(
+                pos=(550, 325), 
+                text_input="LOCAL", 
+                font=self.get_font(75), 
+                base_colour="White", 
+                hovering_colour="#b68f40", 
+                padding=10, 
+                alpha=0),
+
+            Button(
+                pos=(550, 500), 
+                text_input="BOT", 
+                font=self.get_font(75), 
+                base_colour="White", 
+                hovering_colour="#b68f40", 
+                padding=10, 
+                alpha=0),
+
+            Button(
+                pos=(550, 700), 
+                text_input="BACK", 
+                font=self.get_font(60), 
+                base_colour="White", 
+                hovering_colour="#b68f40", 
+                padding=10, 
+                alpha=0)
+        ]
+
+        while True:
+            # renders the titles and centers them
+            menu_text = self.get_font(90).render("MODE", True, "#b68f40")
+            menu_rect = menu_text.get_rect(center=(550, 100))
+            self.screen.blit(menu_text, menu_rect)
+
+            for button in buttons:
+                button.change_colour(pygame.mouse.get_pos())  # updates buttons colour based on hover
+                button.update(self.screen) # draws the buttons
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    connection.close()  
+                    pygame.quit()
+                    sys.exit()
+                    
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    for button in buttons:
+                        if button.check_for_input(pygame.mouse.get_pos()):
+                            if button.text_input == "BACK":
+                                screen_manager.pop() # returns to home screen
+
+                            elif button.text_input == "LOCAL":
+                                difficulty = None # variable that will later on be passed on the othello class as to disable the bot
+
+                            elif button.text_input == "BOT":
+                                screen_manager.push((menu.bot_difficulty, selected_player_id, selected_player_name)) # passes the user to the bot difficulty screen
+                            
+                            # defines the function that starts the game
+                            def start_othello_game():
+                                game = Othello(difficulty, selected_player_id, selected_player_name)
+                                game.run() 
+                           
+                            # this is an example of composition, as the Othello class interacts with the Windows class through the push and run functions while also encapsulating the start_othello_game() function
+                            screen_manager.push(start_othello_game) # pushes the function to start the game
+                            return 
+
+            pygame.display.update()
+
+
+    def bot_difficulty(self, selected_player_id, selected_player_name):
+        self.screen.blit(self.background, (0, 0))
+        
+        # creation of buttons which uses both encapsulation and composition whilst storing the data in the buttons list
+        buttons = [
+            Button(
+                pos=(550, 275), 
+                text_input="EASY", 
+                font=self.get_font(70), 
+                base_colour="White", 
+                hovering_colour="#b68f40", 
+                padding=10, 
+                alpha=0),
+
+            Button(
+                pos=(550, 425), 
+                text_input="MEDIUM", 
+                font=self.get_font(70), 
+                base_colour="White", 
+                hovering_colour="#b68f40", 
+                padding=10, 
+                alpha=0),
+
+            Button(
+                pos=(550, 575), 
+                text_input="HARD", 
+                font=self.get_font(70), 
+                base_colour="White", 
+                hovering_colour="#b68f40", 
+                padding=10, 
+                alpha=0),
+                
+            Button(
+                pos=(550, 700), 
+                text_input="BACK", 
+                font=self.get_font(50), 
+                base_colour="White", 
+                hovering_colour="#b68f40", 
+                padding=10, 
+                alpha=0)
+        ]
+
+        while True:
+            # renders the titles and centers them
+            menu_text = self.get_font(100).render("DIFFICULTY", True, "#b68f40")
+            menu_rect = menu_text.get_rect(center=(550, 100))
+            self.screen.blit(menu_text, menu_rect)
+
+            for button in buttons:
+                button.change_colour(pygame.mouse.get_pos())  # updates buttons colour based on hover
+                button.update(self.screen) # draws the buttons
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    connection.close()  
+                    pygame.quit()
+                    sys.exit()
+
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    for button in buttons:
+                        if button.check_for_input(pygame.mouse.get_pos()):
+                            if button.text_input == "EASY":
+                                difficulty = 1 # sets the depth of the minimax algorithm
+
+                            elif button.text_input == "MEDIUM":
+                                difficulty = 3 # sets the depth of the minimax algorithm
+
+                            elif button.text_input == "HARD":
+                                difficulty = 5 # sets the depth of the minimax algorithm
+
+                            elif button.text_input == "BACK":
+                                screen_manager.pop() # returns to the mode page
+                            
+                            # defines the function that starts the game
+                            def start_othello_game():
+                                game = Othello(difficulty, selected_player_id, selected_player_name)
+                                game.run()  
+
+                            # this is an example of composition, as the Othello class interacts with the Windows class through the push and run functions while also encapsulating the start_othello_game() function
+                            screen_manager.push(start_othello_game) # starts game 
+                            return 
+
+            pygame.display.update()
+
+    def get_font(self, size):
+        return pygame.font.Font(self.font, size)
+    
+class Windows:
+    def __init__(self, screen):
+        self.screen = screen
+        self.screen_stack = []  # stack to keep track of the screens
+
+    def push(self, *screens):
+        # higher order function as it pushes screens (functions) into the stack with optional arguments
+        for screen in screens:
+            if callable(screen):  # checks if it is a callable (function or lambda)
+                self.screen_stack.append(screen)
+
+            elif isinstance(screen, tuple) and callable(screen[0]):
+                # if a tuple is passed, unpacks it as (function, args, kwargs)
+                screen_function, *screen_args = screen
+                self.screen_stack.append(lambda: screen_function(*screen_args))
+
+        self.run()
+
+    def pop(self):
+        # pops the current screen from the stack
+        self.screen_stack.pop()  
+        self.run()  
+
+    def run(self):
+        # runs the top screen
+        self.screen.fill((0, 0, 0)) # clears the screen
+        self.screen_stack[-1]() # runs last element of the stack
+        pygame.display.flip() # updates the display
+
+# initialises the screen
+pygame.init()
+screen = pygame.display.set_mode((1100, 810))
+
+# sets up the global database connection
+connection = sqlite3.connect("playerdata.db")
+cursor = connection.cursor()
+
+# creates the screen manager
+screen_manager = Windows(screen)
+
+# creates the menu instance
+menu = Menu()
+menu.create_table()
+
+# pushes the loading screen onto the stack to begin
+screen_manager.push(menu.loading_screen)
+screen_manager.run()  # runs the top of the stack
+
