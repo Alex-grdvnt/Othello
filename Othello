@@ -268,20 +268,24 @@ class Othello:
         screen = pygame.Surface((250, 450), pygame.SRCALPHA)  # create a transparent surface for end screen
 
         font = self.get_font(20) 
-        if player1_score > player2_score:
-            final_text = font.render("VICTORY", True, '#b68f40')  
+        if self.depth is not None:
+            if player1_score > player2_score:
+                final_text = font.render("VICTORY", True, '#b68f40')  
 
-        elif player1_score < player2_score:
-            final_text = font.render("DEFEATED", True, '#b68f40') 
-        
-        elif player1_score == player2_score:
-            final_text = font.render("DRAW", True, '#b68f40') 
+            elif player1_score < player2_score:
+                final_text = font.render("DEFEATED", True, '#b68f40') 
+            
+            elif player1_score == player2_score:
+                final_text = font.render("DRAW", True, '#b68f40') 
+        else: 
+            if player1_score > player2_score:
+                final_text = font.render("WHITE WON", True, '#b68f40')
 
-        elif player1_score > player2_score and self.depth is None:
-            final_text = font.render("WHITE WON", True, '#b68f40')
-
-        elif player1_score < player2_score and self.depth is None:
-            final_text = font.render("BLACK WON", True, '#b68f40')
+            elif player1_score < player2_score:
+                final_text = font.render("BLACK WON", True, '#b68f40')
+            
+            elif player1_score == player2_score:
+                final_text = font.render("DRAW", True, '#b68f40') 
 
         text_x = (screen.get_width() - final_text.get_width()) // 2  # centers the text horizontally
         text_y = 20  # offsets from the top within end screen
